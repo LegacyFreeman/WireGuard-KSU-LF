@@ -135,6 +135,31 @@ endpoint_routes_file() {
   echo "$wg_data/endpoint-routes.$1"
 }
 
+endpoint_routes_lock_dir() {
+  echo "$wg_data/endpoint-routes.$1.lock"
+}
+
+acquire_endpoint_routes_lock() {
+  iface="$1"
+  lock_dir=$(endpoint_routes_lock_dir "$iface")
+  tries=0
+
+  while ! mkdir "$lock_dir" 2>/dev/null; do
+    tries=$((tries + 1))
+    if [ "$tries" -ge 10 ]; then
+      wg_log "$iface" "timed out waiting for endpoint route lock"
+      return 1
+    fi
+    sleep 1
+  done
+
+  echo "$lock_dir"
+}
+
+release_endpoint_routes_lock() {
+  [ -n "$1" ] && rmdir "$1" 2>/dev/null
+}
+
 endpoint_host() {
   endpoint="$1"
   case "$endpoint" in
@@ -211,16 +236,65 @@ get_underlay_default_route() {
   ' | sort -n | head -1
 }
 
+record_endpoint_route() {
+  family="$1"
+  endpoint_addr="$2"
+  routes_tmp="$3"
+
+  grep -qx "$family $endpoint_addr" "$routes_tmp" 2>/dev/null || echo "$family $endpoint_addr" >> "$routes_tmp"
+}
+
+route_matches_underlay() {
+  current="$1"
+  via="$2"
+  dev="$3"
+
+  echo "$current" | awk -v want_via="$via" -v want_dev="$dev" '
+    {
+      route_via = "-"; route_dev = "";
+      for (i = 1; i <= NF; i++) {
+        if ($i == "via") route_via = $(i + 1);
+        if ($i == "dev") route_dev = $(i + 1);
+      }
+      if (want_via == "-") ok = (route_dev == want_dev);
+      else ok = (route_via == want_via && route_dev == want_dev);
+    }
+    END { exit ok ? 0 : 1 }
+  '
+}
+
+delete_stale_endpoint_routes() {
+  old_routes="$1"
+  new_routes="$2"
+
+  [ -f "$old_routes" ] || return
+
+  while read -r old_family old_addr; do
+    [ -n "$old_family" ] || continue
+    if [ -z "$old_addr" ]; then
+      old_addr="$old_family"
+      old_family=4
+    fi
+    grep -qx "$old_family $old_addr" "$new_routes" 2>/dev/null && continue
+    if [ "$old_family" = "6" ]; then
+      ip -6 route del "$old_addr/128" 2>/dev/null
+    else
+      ip -4 route del "$old_addr/32" 2>/dev/null
+    fi
+  done < "$old_routes"
+}
+
 add_endpoint_route() {
   family="$1"
   iface="$2"
   endpoint_addr="$3"
   routes_tmp="$4"
+  quiet_no_route="$5"
   [ -n "$endpoint_addr" ] || return
 
   route=$(get_underlay_default_route "$family")
   if [ -z "$route" ]; then
-    wg_log "$iface" "no IPv${family} physical default route available for endpoint $endpoint_addr"
+    [ "$quiet_no_route" = "1" ] || wg_log "$iface" "no IPv${family} physical default route available for endpoint $endpoint_addr"
     return
   fi
 
@@ -232,6 +306,12 @@ add_endpoint_route() {
     prefix=32
   fi
 
+  current=$(ip "-$family" route get "$endpoint_addr" 2>/dev/null | head -1)
+  if route_matches_underlay "$current" "$via" "$dev"; then
+    record_endpoint_route "$family" "$endpoint_addr" "$routes_tmp"
+    return
+  fi
+
   if [ "$via" = "-" ]; then
     ip "-$family" route replace "$endpoint_addr/$prefix" dev "$dev" 2>>"$log_file" || return
     wg_log "$iface" "endpoint IPv${family} route $endpoint_addr dev $dev"
@@ -240,7 +320,25 @@ add_endpoint_route() {
     wg_log "$iface" "endpoint IPv${family} route $endpoint_addr via $via dev $dev"
   fi
 
-  grep -qx "$family $endpoint_addr" "$routes_tmp" 2>/dev/null || echo "$family $endpoint_addr" >> "$routes_tmp"
+  record_endpoint_route "$family" "$endpoint_addr" "$routes_tmp"
+}
+
+add_runtime_endpoint_routes() {
+  iface="$1"
+  routes_tmp="$2"
+  quiet_no_route="$3"
+
+  $WG show "$iface" endpoints 2>/dev/null | while read -r _ endpoint; do
+    [ -n "$endpoint" ] || continue
+    [ "$endpoint" = "(none)" ] && continue
+
+    endpoint_addr=$(endpoint_host "$endpoint")
+    if is_ipv4 "$endpoint_addr"; then
+      add_endpoint_route 4 "$iface" "$endpoint_addr" "$routes_tmp" "$quiet_no_route"
+    elif is_ipv6 "$endpoint_addr"; then
+      add_endpoint_route 6 "$iface" "$endpoint_addr" "$routes_tmp" "$quiet_no_route"
+    fi
+  done
 }
 
 refresh_endpoint_routes() {
@@ -248,9 +346,14 @@ refresh_endpoint_routes() {
   iface="$2"
   old_routes=$(endpoint_routes_file "$iface")
   new_routes="${old_routes}.tmp"
+  lock_dir=$(acquire_endpoint_routes_lock "$iface") || return
 
   mkdir -p "$wg_data"
   : > "$new_routes"
+
+  if iface_running "$iface"; then
+    add_runtime_endpoint_routes "$iface" "$new_routes" 1
+  fi
 
   grep -i '^[[:space:]]*Endpoint[[:space:]]*=' "$conf" | while IFS= read -r line; do
     endpoint=$(echo "$line" | sed 's/^[^=]*= *//')
@@ -269,28 +372,36 @@ refresh_endpoint_routes() {
     fi
   done
 
-  if [ -f "$old_routes" ]; then
-    while read -r old_family old_addr; do
-      [ -n "$old_family" ] || continue
-      if [ -z "$old_addr" ]; then
-        old_addr="$old_family"
-        old_family=4
-      fi
-      grep -qx "$old_family $old_addr" "$new_routes" 2>/dev/null && continue
-      if [ "$old_family" = "6" ]; then
-        ip -6 route del "$old_addr/128" 2>/dev/null
-      else
-        ip -4 route del "$old_addr/32" 2>/dev/null
-      fi
-    done < "$old_routes"
-  fi
+  delete_stale_endpoint_routes "$old_routes" "$new_routes"
   mv "$new_routes" "$old_routes"
+  release_endpoint_routes_lock "$lock_dir"
+}
+
+repair_endpoint_routes() {
+  filter="$1"
+  for conf in "$wg_data"/*.conf; do
+    [ -f "$conf" ] || continue
+    iface=$(basename "$conf" .conf)
+    [ -n "$filter" ] && [ "$filter" != "$iface" ] && continue
+    iface_running "$iface" || continue
+
+    old_routes=$(endpoint_routes_file "$iface")
+    new_routes="${old_routes}.tmp"
+    lock_dir=$(acquire_endpoint_routes_lock "$iface") || continue
+    mkdir -p "$wg_data"
+    : > "$new_routes"
+    add_runtime_endpoint_routes "$iface" "$new_routes" 1
+    delete_stale_endpoint_routes "$old_routes" "$new_routes"
+    mv "$new_routes" "$old_routes"
+    release_endpoint_routes_lock "$lock_dir"
+  done
 }
 
 remove_endpoint_routes() {
   iface="$1"
   routes_file=$(endpoint_routes_file "$iface")
-  [ -f "$routes_file" ] || return
+  lock_dir=$(acquire_endpoint_routes_lock "$iface") || return
+  [ -f "$routes_file" ] || { release_endpoint_routes_lock "$lock_dir"; return; }
   while read -r family endpoint_addr; do
     [ -n "$family" ] || continue
     if [ -z "$endpoint_addr" ]; then
@@ -304,6 +415,7 @@ remove_endpoint_routes() {
     fi
   done < "$routes_file"
   rm -f "$routes_file"
+  release_endpoint_routes_lock "$lock_dir"
 }
 
 # --- wg-quick replacement for Android (sh-based) ---
@@ -728,8 +840,11 @@ case "$1" in
   reresolve-dns)
     reresolve_dns "$2"
     ;;
+  repair-routes)
+    repair_endpoint_routes "$2"
+    ;;
   reresolve-log)
     tail -50 "$reresolve_log" 2>/dev/null || echo "No re-resolve log"
     ;;
-  *)       echo "Usage: wgksu {start|stop|restart|status|enable|disable|stay-awake|genkey|reresolve-dns} [interface]" ;;
+  *)       echo "Usage: wgksu {start|stop|restart|status|enable|disable|stay-awake|genkey|reresolve-dns|repair-routes} [interface]" ;;
 esac

@@ -225,6 +225,11 @@ start_iface_when_ready() {
     [ -f "$wg_data/reresolve.${iface}" ] && . "$wg_data/reresolve.${iface}"
     if [ "${RERESOLVE_ENABLED:-1}" = "1" ]; then
       (
+        while sleep 30; do
+          "$WGKSU" repair-routes "$iface" 2>/dev/null
+        done
+      ) &
+      (
         while sleep "${RERESOLVE_INTERVAL:-120}"; do
           "$WGKSU" reresolve-dns "$iface" 2>/dev/null
         done
