@@ -547,7 +547,7 @@ wg_up() {
     IFS=','
     for d in $dns; do
       d=$(echo "$d" | tr -d ' ')
-      ndc resolver setnetdns "$iface" "" "$d" 2>/dev/null || \
+      ndc resolver setnetdns "$iface" "" "$d" >/dev/null 2>&1 || \
         setprop net.dns${i} "$d" 2>/dev/null
       i=$((i + 1))
     done
